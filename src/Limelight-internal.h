@@ -1,0 +1,198 @@
+#pragma once
+#include "Platform.h"
+#include "MatLiveProfile.h"
+extern LI_MAT_LIVE_PROFILE MatLiveProfile;
+
+#include "Limelight.h"
+#include "PlatformSockets.h"
+#include "tsnet_proxy.h"
+#include "PlatformThreads.h"
+#include "PlatformCrypto.h"
+#include "Video.h"
+#include "Input.h"
+#include "RtpAudioQueue.h"
+#include "RtpVideoQueue.h"
+#include "ByteBuffer.h"
+#include "PyrowaveReassembly.h"
+
+#include <enet/enet.h>
+#include <stdatomic.h>
+
+// Common globals
+extern char* RemoteAddrString;
+extern struct sockaddr_storage RemoteAddr;
+extern struct sockaddr_storage LocalAddr;
+extern SOCKADDR_LEN AddrLen;
+extern int AppVersionQuad[4];
+extern STREAM_CONFIGURATION StreamConfig;
+extern CONNECTION_LISTENER_CALLBACKS ListenerCallbacks;
+extern ConnListenerRemoteTextContext RemoteTextContextCallback;
+extern DECODER_RENDERER_CALLBACKS VideoCallbacks;
+extern AUDIO_RENDERER_CALLBACKS AudioCallbacks;
+extern int NegotiatedVideoFormat;
+extern atomic_bool ConnectionInterrupted;
+extern bool HighQualitySurroundSupported;
+extern bool HighQualitySurroundEnabled;
+extern OPUS_MULTISTREAM_CONFIGURATION NormalQualityOpusConfig;
+extern OPUS_MULTISTREAM_CONFIGURATION HighQualityOpusConfig;
+extern int AudioPacketDuration;
+extern bool AudioEncryptionEnabled;
+extern bool ReferenceFrameInvalidationSupported;
+
+// Audio codec selected for this session (AUDIO_CODEC_*). Defaults to OPUS.
+extern int NegotiatedAudioCodec;
+// Dynamic HDR format/fallback negotiated in the RTSP ANNOUNCE response
+// (DYNAMIC_HDR_FORMAT_* / DYNAMIC_HDR_FALLBACK_*).
+extern int NegotiatedDynamicHdrFormat;
+extern int NegotiatedDynamicHdrFallback;
+// Audio bitrate (bps) selected for AC3/E-AC3 sessions. 0 when codec == OPUS.
+extern int NegotiatedAudioBitrate;
+
+extern uint16_t RtspPortNumber;
+extern uint16_t ControlPortNumber;
+extern uint16_t AudioPortNumber;
+extern uint16_t VideoPortNumber;
+extern uint16_t MicPortNumber;
+
+extern SS_PING AudioPingPayload;
+extern SS_PING VideoPingPayload;
+extern SS_PING MicPingPayload;
+extern uint32_t ControlConnectData;
+
+extern uint32_t SunshineFeatureFlags;
+
+// Encryption flags shared by Sunshine and Moonlight in RTSP
+#define SS_ENC_CONTROL_V2 0x01
+#define SS_ENC_VIDEO 0x02
+#define SS_ENC_AUDIO 0x04
+#define SS_ENC_MICROPHONE 0x08
+
+extern uint32_t EncryptionFeaturesSupported;
+extern uint32_t EncryptionFeaturesRequested;
+extern uint32_t EncryptionFeaturesEnabled;
+
+// Microphone RTP stream values
+#define MIC_PACKET_MAGIC 0x12345678
+#define MIC_PACKET_TYPE_OPUS 0x61
+#define MAX_MIC_PACKET_SIZE 1400
+
+// ENet channel ID values
+#define CTRL_CHANNEL_GENERIC      0x00
+#define CTRL_CHANNEL_URGENT       0x01 // IDR, LTR ACK and RFI
+#define CTRL_CHANNEL_KEYBOARD     0x02
+#define CTRL_CHANNEL_MOUSE        0x03
+#define CTRL_CHANNEL_PEN          0x04
+#define CTRL_CHANNEL_TOUCH        0x05
+#define CTRL_CHANNEL_GAMEPAD_BASE 0x10 // 0x10 to 0x1F by controller index
+#define CTRL_CHANNEL_SENSOR_BASE  0x20 // 0x20 to 0x2F by controller index
+#define CTRL_CHANNEL_COUNT        0x30
+
+#ifndef UINT24_MAX
+#define UINT24_MAX 0xFFFFFF
+#endif
+
+#define U16(x) ((unsigned short) ((x) & UINT16_MAX))
+#define U24(x) ((unsigned int) ((x) & UINT24_MAX))
+#define U32(x) ((unsigned int) ((x) & UINT32_MAX))
+
+#define isBefore16(x, y) (U16((x) - (y)) > (UINT16_MAX/2))
+#define isBefore24(x, y) (U24((x) - (y)) > (UINT24_MAX/2))
+#define isBefore32(x, y) (U32((x) - (y)) > (UINT32_MAX/2))
+
+#define APP_VERSION_AT_LEAST(a, b, c)                                                       \
+    ((AppVersionQuad[0] > (a)) ||                                                           \
+     (AppVersionQuad[0] == (a) && AppVersionQuad[1] > (b)) ||                               \
+     (AppVersionQuad[0] == (a) && AppVersionQuad[1] == (b) && AppVersionQuad[2] >= (c)))
+
+#define IS_SUNSHINE() (AppVersionQuad[3] < 0)
+
+// Client feature flags for x-ml-general.featureFlags SDP attribute.
+// Existing fork assignments are frozen. New fork-only features allocate from
+// 0x8000 downward; see docs/protocol-extension-registry.md.
+#define ML_FF_FEC_STATUS 0x01 // Client sends SS_FRAME_FEC_STATUS for frame losses
+#define ML_FF_SESSION_ID_V1 0x02 // Client supports X-SS-Ping-Payload and X-SS-Connect-Data
+#define ML_FF_DS5_HAPTICS_PCM 0x04 // Client accepts authored DualSense PCM on the control stream
+#define ML_FF_DS5_HAPTICS_IR_V2 0x08 // Client selected simulated DualSense and accepts authored IR v2
+#define ML_FF_DS5_HAPTICS_IR_EXTENDED 0x80 // Client accepts continuous-state/source-event v2 IR enhancement (0x550B)
+#define ML_FF_REMOTE_TEXT_CONTEXT 0x10 // Client accepts remote text context updates
+#define ML_FF_PYROWAVE 0x20 // Client accepts the experimental PyroWave video contract
+#define ML_FF_DS5_HAPTICS_STATE 0x40 // Client accepts absolute DS5 actuator controls (0x550D)
+#define ML_FF_HOST_SESSION_STATE 0x100 // Client accepts host session lock state updates (0x550E)
+extern ConnListenerDs5HapticsState Ds5HapticsStateCallback;
+extern ConnListenerHostSessionState HostSessionStateCallback;
+#define ML_FF_ENDPOINT_AUTO_REFRESH 0x8000 // Client requests authenticated endpoint migration v1
+extern bool EndpointRefreshRequested;
+void LiSetEndpointAutoRefreshEnabled(bool enabled);
+
+#define UDP_RECV_POLL_TIMEOUT_MS 100
+
+// At this value or above, we will request high quality audio unless CAPABILITY_SLOW_OPUS_DECODER
+// is set on the audio renderer.
+#define HIGH_AUDIO_BITRATE_THRESHOLD 15000
+
+// Below this value, we will request 20 ms audio frames to reduce bandwidth if the audio
+// renderer sets CAPABILITY_SUPPORTS_ARBITRARY_AUDIO_DURATION.
+#define LOW_AUDIO_BITRATE_TRESHOLD 5000
+
+// Internal macro for checking the magic byte of the audio configuration value
+#define MAGIC_BYTE_FROM_AUDIO_CONFIG(x) ((x) & 0xFF)
+
+int serviceEnetHost(ENetHost* client, ENetEvent* event, enet_uint32 timeoutMs);
+int gracefullyDisconnectEnetPeer(ENetHost* host, ENetPeer* peer, enet_uint32 lingerTimeoutMs);
+int extractVersionQuadFromString(const char* string, int* quad);
+bool isReferenceFrameInvalidationSupportedByDecoder(void);
+bool isReferenceFrameInvalidationEnabled(void);
+void* extendBuffer(void* ptr, size_t newSize);
+
+void fixupMissingCallbacks(PDECODER_RENDERER_CALLBACKS* drCallbacks, PAUDIO_RENDERER_CALLBACKS* arCallbacks,
+    PCONNECTION_LISTENER_CALLBACKS* clCallbacks);
+void setRecorderCallbacks(PDECODER_RENDERER_CALLBACKS drCallbacks, PAUDIO_RENDERER_CALLBACKS arCallbacks);
+
+char* getSdpPayloadForStreamConfig(int rtspClientVersion, int* length);
+
+int initializeControlStream(void);
+int startControlStream(void);
+int stopControlStream(void);
+void destroyControlStream(void);
+void connectionDetectedFrameLoss(uint32_t startFrame, uint32_t endFrame);
+void connectionReceivedCompleteFrame(uint32_t frameIndex, bool frameIsLTR);
+void connectionSawFrame(uint32_t frameIndex);
+void connectionSendFrameFecStatus(PSS_FRAME_FEC_STATUS fecStatus);
+extern bool VideoFecControlSupported;
+void connectionRecordFecBlock(uint32_t frame, uint8_t block, uint16_t data, uint16_t received);
+int sendInputPacketOnControlStream(unsigned char* data, int length, uint8_t channelId, uint32_t flags, bool moreData);
+void flushInputOnControlStream(void);
+bool isControlDataInTransit(void);
+
+int performRtspHandshake(PSERVER_INFORMATION serverInfo);
+
+void initializeVideoDepacketizer(int pktSize);
+void destroyVideoDepacketizer(void);
+bool queueRtpPacket(PRTPV_QUEUE_ENTRY queueEntry);
+void stopVideoDepacketizer(void);
+void requestDecoderRefresh(void);
+void notifyFrameLost(unsigned int frameNumber, bool speculative);
+
+void initializeVideoStream(void);
+void destroyVideoStream(void);
+void notifyKeyFrameReceived(void);
+int startVideoStream(void* rendererContext, int drFlags);
+void stopVideoStream(void);
+
+int initializeAudioStream(void);
+int notifyAudioPortNegotiationComplete(void);
+void destroyAudioStream(void);
+int startAudioStream(void* audioContext, int arFlags);
+void stopAudioStream(void);
+
+int initializeInputStream(void);
+void destroyInputStream(void);
+int startInputStream(void);
+int stopInputStream(void);
+// Only the control stream updates remote demand, before dispatching platform callbacks.
+int setControllerMotionEnabled(uint16_t controller, uint8_t type, bool enabled);
+
+int initializeMicrophoneStream(void);
+void destroyMicrophoneStream(void);
+int sendMicrophoneOpusData(const unsigned char* opusData, int opusLength);
+bool isMicrophoneEncryptionEnabled(void);
